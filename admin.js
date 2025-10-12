@@ -8,6 +8,7 @@ const groupChatId = process.env.GROUP_CHAT_ID;
 const bot = new TelegramBot(token, { polling: true });
 const userRequests = {};
 
+// Получение ссылки на группу
 async function getInviteLink() {
     try {
         const link = await bot.exportChatInviteLink(groupChatId);
@@ -18,6 +19,7 @@ async function getInviteLink() {
     }
 }
 
+// Проверка подписки пользователя на группу
 async function isUserInGroup(userId) {
     try {
         const member = await bot.getChatMember(groupChatId, userId);
@@ -27,8 +29,9 @@ async function isUserInGroup(userId) {
     }
 }
 
-// /start
+// /start только в личных сообщениях
 bot.onText(/^\/start$/, (msg) => {
+    if (msg.chat.type !== 'private') return;
     const chatId = msg.chat.id;
     const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
 
@@ -39,12 +42,8 @@ bot.onText(/^\/start$/, (msg) => {
     bot.sendMessage(chatId, `Привет, ${username}! Перед отправкой запроса ознакомьтесь с правилами:`, {
         reply_markup: {
             inline_keyboard: [
-                [
-                    { text: '📖 Ознакомиться с правилами', url: 'https://telegra.ph/Pravila-nashej-gruppy-10-01' }
-                ],
-                [
-                    { text: '✅ Ознакомился', callback_data: 'ack_rules' }
-                ]
+                [{ text: '📖 Ознакомиться с правилами', url: 'https://telegra.ph/Pravila-nashej-gruppy-10-01' }],
+                [{ text: '✅ Ознакомился', callback_data: 'ack_rules' }]
             ]
         }
     });
@@ -57,8 +56,9 @@ bot.onText(/^\/getchatid$/, (msg) => {
     bot.sendMessage(chatId, `👤 Username: ${username}\n🆔 Chat ID: ${chatId}`);
 });
 
-// Приём сообщений от пользователя
+// Обработка сообщений от пользователей (только в личке)
 bot.on('message', async (msg) => {
+    if (msg.chat.type !== 'private') return;
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
@@ -80,12 +80,8 @@ bot.on('message', async (msg) => {
         return bot.sendMessage(chatId, '⚠️ Сначала ознакомьтесь с правилами:', {
             reply_markup: {
                 inline_keyboard: [
-                    [
-                        { text: '📖 Ознакомиться с правилами', url: 'https://telegra.ph/Pravila-nashej-gruppy-10-01' }
-                    ],
-                    [
-                        { text: '✅ Ознакомился', callback_data: 'ack_rules' }
-                    ]
+                    [{ text: '📖 Ознакомиться с правилами', url: 'https://telegra.ph/Pravila-nashej-gruppy-10-01' }],
+                    [{ text: '✅ Ознакомился', callback_data: 'ack_rules' }]
                 ]
             }
         });
