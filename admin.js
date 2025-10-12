@@ -80,7 +80,7 @@ bot.onText(/^\/ticket(?:\s(.+))?$/, async (msg, match) => {
     user.ticketTimestamp = now;
 
     bot.sendMessage(userId, `✅ Ваш тикет #${ticketId} отправлен администрации.`);
-    const caption = `📩 *Новый тикет #${ticketId}*\n👤 ${username} (${userId})\n💬 ${text}\n\nДля ответа: /aticket ${ticketId} <текст>`;
+    const caption = `📩 *Новый тикет #${ticketId}*\n👤 ${username}\n💬 ${text}`;
     switch (contentType) {
         case 'photo': bot.sendPhoto(adminChatId, content, { caption, parse_mode: 'Markdown' }); break;
         case 'video': bot.sendVideo(adminChatId, content, { caption, parse_mode: 'Markdown' }); break;
@@ -115,7 +115,7 @@ bot.onText(/^\/tickets$/, (msg) => {
     bot.sendMessage(adminChatId, list, { parse_mode: 'Markdown' });
 });
 
-// ===== Callback кнопки и запросы =====
+// ===== Callback кнопки =====
 bot.on('callback_query', async (query) => {
     const id = query.from.id;
     const user = userRequests[id] ||= { acknowledgedRules: false, blocked: false, timestamp: 0, ticketTimestamp: 0, selectedAction: null, userId: id, username: query.from.username ? `@${query.from.username}` : query.from.first_name };
@@ -136,13 +136,12 @@ bot.on('callback_query', async (query) => {
 
         switch(action) {
             case 'publish':
-                let caption = `📨 *Новый запрос от ${req.username}:*\n💬 ${req.text || '(без текста)'}`;
                 switch(req.contentType) {
-                    case 'photo': bot.sendPhoto(groupChatId, req.content, { caption, parse_mode: 'Markdown' }); break;
-                    case 'video': bot.sendVideo(groupChatId, req.content, { caption, parse_mode: 'Markdown' }); break;
-                    case 'document': bot.sendDocument(groupChatId, req.content, { caption, parse_mode: 'Markdown' }); break;
-                    case 'voice': bot.sendVoice(groupChatId, req.content, { caption, parse_mode: 'Markdown' }); break;
-                    default: bot.sendMessage(groupChatId, caption, { parse_mode: 'Markdown' });
+                    case 'photo': bot.sendPhoto(groupChatId, req.content, { caption: req.text || undefined }); break;
+                    case 'video': bot.sendVideo(groupChatId, req.content, { caption: req.text || undefined }); break;
+                    case 'document': bot.sendDocument(groupChatId, req.content, { caption: req.text || undefined }); break;
+                    case 'voice': bot.sendVoice(groupChatId, req.content); break;
+                    default: bot.sendMessage(groupChatId, req.text || '(пустой запрос)'); 
                 }
                 bot.sendMessage(req.userId, '✅ Ваш запрос опубликован в группе.');
                 break;
@@ -189,11 +188,13 @@ bot.on('message', async (msg) => {
     const reqId = requestCounter++;
     requestsQueue[reqId] = { userId, username: user.username, text, contentType, content };
 
-    const keyboard = { inline_keyboard: [
-        [{ text: '✅ Опубликовать', callback_data: `req_${reqId}_publish` }, { text: '❌ Отклонить', callback_data: `req_${reqId}_reject` }, { text: '🚫 Блок/Разблок', callback_data: `req_${reqId}_block` }]
-    ]};
+    const keyboard = { inline_keyboard: [[
+        { text: '✅ Опубликовать', callback_data: `req_${reqId}_publish` },
+        { text: '❌ Отклонить', callback_data: `req_${reqId}_reject` },
+        { text: '🚫 Блок/Разблок', callback_data: `req_${reqId}_block` }
+    ]]};
 
-    const caption = `📨 *Новый запрос #${reqId}*\n👤 ${user.username} (${userId})\n💬 ${text || '(без текста)'}`;
+    const caption = `📨 *Новый запрос #${reqId}*\n💬 ${text || '(без текста)'}`;
     switch(contentType) {
         case 'photo': bot.sendPhoto(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: keyboard }); break;
         case 'video': bot.sendVideo(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: keyboard }); break;
