@@ -68,38 +68,79 @@ bot.onText(/^\/start$/, (msg) => {
 // Обработка меню
 bot.on('callback_query', async (query) => {
     const id = query.from.id;
-    if (!userRequests[id]) userRequests[id] = { acknowledgedRules: false, blocked: false, timestamp: 0, ticketTimestamp: 0, userId: id };
+
+    // Создаём объект пользователя, если его нет
+    if (!userRequests[id]) {
+        userRequests[id] = {
+            acknowledgedRules: false,
+            blocked: false,
+            timestamp: 0,
+            ticketTimestamp: 0,
+            userId: id,
+            username: query.from.username ? `@${query.from.username}` : query.from.first_name,
+            selectedAction: null
+        };
+    }
 
     const userData = userRequests[id];
 
+    // Ознакомление с правилами
     if (query.data === 'ack_rules') {
         if (!userData.acknowledgedRules) {
             userData.acknowledgedRules = true;
+
             const keyboard = {
                 inline_keyboard: [
                     [{ text: '📨 Отправить запрос', callback_data: 'menu_request' }],
                     [{ text: '🎫 Отправить тикет с жалобой', callback_data: 'menu_ticket' }]
                 ]
             };
+
             await bot.sendMessage(id, '✅ Отлично! Теперь вы можете отправлять запросы и тикеты.', { reply_markup: keyboard });
         }
         return bot.answerCallbackQuery(query.id);
     }
 
+    // Блокировка действий до ознакомления с правилами
     if (!userData.acknowledgedRules) {
         return bot.answerCallbackQuery(query.id, { text: 'Сначала ознакомьтесь с правилами.' });
     }
 
-    // Сохраняем выбранное действие
+    // Выбор действия пользователем
     if (query.data === 'menu_request') {
         userData.selectedAction = 'request';
         await bot.sendMessage(id, '📨 Теперь отправьте сообщение для запроса (только текст/файл/фото/видео).');
         return bot.answerCallbackQuery(query.id);
     }
+
     if (query.data === 'menu_ticket') {
         userData.selectedAction = 'ticket';
         await bot.sendMessage(id, '🎫 Чтобы создать тикет, используйте команду:\n/ticket <текст>\n📌 Вы можете отправлять тикет раз в 1 минуту.');
         return bot.answerCallbackQuery(query.id);
+    }
+
+    // Динамическая кнопка блокировки/разблокировки
+    if (query.data.startsWith('block_')) {
+        const [_, targetId] = query.data.split('_');
+        const targetUser = userRequests[targetId];
+        if (!targetUser) return bot.answerCallbackQuery(query.id, { text: 'Пользователь не найден.' });
+
+        targetUser.blocked = !targetUser.blocked;
+
+        const statusText = targetUser.blocked
+            ? '🚫 Пользователь заблокирован.'
+            : '🔓 Пользователь разблокирован.';
+
+        // Меняем текст кнопки на лету
+        const keyboard = {
+            inline_keyboard: [
+                [{ text: targetUser.blocked ? '🔓 Разблокировать' : '⛔ Заблокировать', callback_data: `block_${targetId}` }]
+            ]
+        };
+
+        await bot.editMessageReplyMarkup(keyboard, { chat_id: query.message.chat.id, message_id: query.message.message_id });
+        await bot.sendMessage(targetId, targetUser.blocked ? '🚫 Вы заблокированы и не можете отправлять запросы.' : '🔓 Вы снова можете отправлять запросы.');
+        return bot.answerCallbackQuery(query.id, { text: statusText });
     }
 });
 
