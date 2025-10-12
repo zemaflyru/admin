@@ -58,13 +58,16 @@ bot.onText(/^\/getchatid$/, (msg) => {
 
 // Обработка сообщений от пользователей (только в личке)
 bot.on('message', async (msg) => {
-    if (msg.chat.type !== 'private') return;
+    if (msg.chat.type !== 'private') return; // только личка
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
 
     if (msg.from.is_bot) return;
     if (chatId == adminChatId) return;
+
+    // ИГНОРИРОВАТЬ команду /start
+    if (msg.text && msg.text.startsWith('/start')) return;
 
     if (!userRequests[userId]) {
         userRequests[userId] = { acknowledgedRules: false, blocked: false, timestamp: 0, userId, username };
@@ -85,7 +88,7 @@ bot.on('message', async (msg) => {
                 ]
             }
         });
-    }
+  
 
     const subscribed = await isUserInGroup(userId);
     if (!subscribed) {
