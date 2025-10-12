@@ -376,9 +376,18 @@ bot.on('message', async (msg) => {
 // ===== Обработка callback кнопок =====
 bot.on('callback_query', async (query) => {
     const [action, userId] = query.data.split('_');
-    const userData = userRequests[userId];
-
-    if (!userData) return bot.answerCallbackQuery(query.id, { text: 'Запрос не найден или уже обработан.' });
+    if (!userRequests[userId]) {
+    userRequests[userId] = {
+        acknowledgedRules: false,
+        blocked: false,
+        timestamp: 0,
+        ticketTimestamp: 0,
+        selectedAction: null,
+        userId: userId,
+        username: null // или пустая строка, если не известно
+    };
+}
+const userData = userRequests[userId];
 
     switch (action) {
         case 'publish':
