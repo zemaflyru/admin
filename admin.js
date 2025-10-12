@@ -50,6 +50,13 @@ bot.onText(/^\/start$/, (msg) => {
     });
 });
 
+// Команда для получения ID чата
+bot.onText(/^\/getchatid$/, (msg) => {
+    const chatId = msg.chat.id;
+    const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
+    bot.sendMessage(chatId, `👤 Username: ${username}\n🆔 Chat ID: ${chatId}`);
+});
+
 // Приём сообщений от пользователя
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
