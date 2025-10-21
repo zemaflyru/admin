@@ -144,30 +144,25 @@ bot.onText(/^\/start$/, async (msg) => {
     const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
 
     // создаём запись пользователя, если нет
-    const isNewUser = !userRequests[id];
-    if (isNewUser) {
-        userRequests[id] = {
-            acknowledgedRules: false,
-            blocked: false,
-            ticketBlocked: false,
-            timestamp: 0,
-            ticketTimestamp: 0,
-            selectedAction: null,
-            userId: id,
-            username
-        };
-    }
-
+    userRequests[id] ||= {
+        acknowledgedRules: false,
+        blocked: false,
+        ticketBlocked: false,
+        timestamp: 0,
+        ticketTimestamp: 0,
+        selectedAction: null,
+        userId: id,
+        username
+    };
     const user = userRequests[id];
 
     // 📸 Ссылка на изображение
     const photoUrl = 'https://image.winudf.com/v2/image/bW9iaS5hbmRyb2FwcC5wcm9zcGVyaXR5YXBwcy5jNTExMV9zY3JlZW5fN18xNTI0MDQxMDUwXzAyMQ/screen-7.jpg?fakeurl=1&type=.jpg';
 
-    // 🧩 Если админ — сразу показываем меню, без правил
+    // 🧩 Админ — сразу меню
     if (botAdmins.has(Number(id))) {
         user.acknowledgedRules = true;
 
-        // Отправка фото админу
         await bot.sendPhoto(id, photoUrl, {
             caption: `👋 Привет, ${username}! Вы вошли как администратор.`
         });
@@ -181,7 +176,7 @@ bot.onText(/^\/start$/, async (msg) => {
         return bot.sendMessage(id, `Выберите действие:`, { reply_markup: adminKeyboard });
     }
 
-    // 🔒 Обычные пользователи — должны подтвердить правила
+    // 🔒 Обычные пользователи
     const keyboard = user.acknowledgedRules
         ? {
             inline_keyboard: [
@@ -196,15 +191,14 @@ bot.onText(/^\/start$/, async (msg) => {
             ]
         };
 
-    // Отправка фото новым пользователям
-    if (isNewUser) {
-        await bot.sendPhoto(id, photoUrl, {
-            caption: `👋 Привет, ${username}! Добро пожаловать!`
-        });
-    }
+    // 📸 Отправляем фото ВСЕМ пользователям
+    await bot.sendPhoto(id, photoUrl, {
+        caption: `👋 Привет, ${username}! Добро пожаловать!`
+    });
 
     await bot.sendMessage(id, `👋 Выберите действие:`, { reply_markup: keyboard });
 });
+
 
 
 
