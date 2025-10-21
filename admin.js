@@ -140,8 +140,11 @@ async function isUserInGroup(userId) {
 // ===== /start =====
 bot.onText(/^\/start$/, async (msg) => {
     if (msg.chat.type !== 'private') return;
+
     const id = msg.from.id;
     const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
+
+    const isNewUser = !userRequests[id]; // флаг, новый ли пользователь
 
     // создаём запись пользователя, если нет
     userRequests[id] ||= {
@@ -158,6 +161,11 @@ bot.onText(/^\/start$/, async (msg) => {
 
     // 📸 Ссылка на изображение
     const photoUrl = 'https://image.winudf.com/v2/image/bW9iaS5hbmRyb2FwcC5wcm9zcGVyaXR5YXBwcy5jNTExMV9zY3JlZW5fN18xNTI0MDQxMDUwXzAyMQ/screen-7.jpg?fakeurl=1&type=.jpg';
+
+    // --- уведомление админа о новом пользователе ---
+    if (isNewUser) {
+        await bot.sendMessage(adminChatId, `👤 Пользователь ${username} успешно прошел авторизацию в боте!`);
+    }
 
     // 🧩 Админ — сразу меню
     if (botAdmins.has(Number(id))) {
@@ -191,12 +199,113 @@ bot.onText(/^\/start$/, async (msg) => {
             ]
         };
 
-    // 📸 Отправляем фото ВСЕМ пользователям
+    // 📸 ВСЕГДА отправляем фото при /start
     await bot.sendPhoto(id, photoUrl, {
         caption: `👋 Привет, ${username}! Добро пожаловать!`
     });
 
     await bot.sendMessage(id, `👋 Выберите действие:`, { reply_markup: keyboard });
+
+    // --- сохраняем пользователя в БД ---
+    upsertUserToDB(user);
+});
+
+
+
+// ===== Команда: /get =====
+bot.onText(/^\/get(?:\s(.+))?$/, async (msg, match) => {
+    const fromId = msg.from.id;
+
+    if (!botAdmins.has(Number(fromId))) {
+        return bot.sendMessage(msg.chat.id, '❌ У вас нет прав для просмотра информации о пользователе.');
+    }
+
+    const target = match[1]?.trim();
+    if (!target) {
+        return bot.sendMessage(msg.chat.id, '⚠️ Использование: /get <id|@username>');
+    }
+
+    // Функция для экранирования Markdown
+    function escapeMarkdown(text) {
+        if (!text) return '';
+        return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+    }
+
+    try {
+        let userId = null;
+        let displayName = null;
+
+        if (target.startsWith('@')) {
+            const usernameQuery = target.slice(1);
+            const response = await fetch(
+                `http://c14.play2go.cloud:20028/api/user?username=${encodeURIComponent(usernameQuery)}`
+            );
+
+            if (!response.ok) return bot.sendMessage(msg.chat.id, `❌ Ошибка API: ${response.status}`);
+
+            const data = await response.json();
+            const userData = data?.user || (Array.isArray(data) && data[0]) || data;
+
+            if (!userData?.id) return bot.sendMessage(msg.chat.id, '❌ Пользователь не найден через API.');
+
+            userId = Number(userData.id);
+            displayName = userData.username ? `@${userData.username}` : userData.first_name || target;
+        } else {
+            userId = Number(target);
+            if (isNaN(userId)) return bot.sendMessage(msg.chat.id, '❌ Неверный ID пользователя.');
+            displayName = target;
+        }
+
+        const user = userRequests[userId] ||= {
+            blocked: false,
+            ticketBlocked: false,
+            userId,
+            username: displayName
+        };
+
+        const memberStatus = await isUserInGroup(userId) ? 'Участник группы' : 'Не в группе';
+        const isAdmin = botAdmins.has(userId) ? 'Админ' : 'Пользователь';
+
+        // Экранируем Markdown
+        const safeUsername = escapeMarkdown(user.username);
+
+        const text = `👤 *Пользователь:* ${safeUsername}\n` +
+                     `🆔 *ID:* ${userId}\n` +
+                     `💬 *Статус:* ${isAdmin}\n` +
+                     `🚫 *Заблокирован для запросов:* ${user.blocked ? 'Да' : 'Нет'}\n` +
+                     `🎫 *Заблокирован для тикетов:* ${user.ticketBlocked ? 'Да' : 'Нет'}\n` +
+                     `🔗 *В группе:* ${memberStatus}`;
+
+        const keyboard = {
+            inline_keyboard: [
+                [
+                    {
+                        text: user.blocked ? '🔓 Разблокировать запросы' : '🔒 Заблокировать запросы',
+                        callback_data: `toggleBlockReq_${userId}`
+                    },
+                    {
+                        text: user.ticketBlocked ? '🔓 Разблокировать тикеты' : '🔒 Заблокировать тикеты',
+                        callback_data: `toggleBlockTicket_${userId}`
+                    }
+                ],
+                [
+                    {
+                        text: '✉️ Написать пользователю',
+                        callback_data: `writeUser_${userId}`
+                    }
+                ]
+            ]
+        };
+
+        await bot.sendMessage(msg.chat.id, text, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+        });
+
+    } catch (err) {
+        console.error(err);
+        bot.sendMessage(msg.chat.id, '❌ Не удалось получить данные пользователя через API.');
+    }
 });
 
 
@@ -380,6 +489,43 @@ bot.on('message', async (msg) => {
 });
 
 
+// ===== /stats =====
+bot.onText(/^\/stats$/, async (msg) => {
+    const chatId = msg.chat.id;
+    const fromId = msg.from.id;
+
+    // Только админы могут использовать
+    if (!botAdmins.has(Number(fromId))) return;
+    // Только в админ-чате
+    if (chatId.toString() !== adminChatId.toString()) return;
+
+    // Отправляем сообщение-заглушку
+    const statusMsg = await bot.sendMessage(chatId, '📊 Загружаем статистику...');
+
+    // Загружаем статистику из базы
+    db.serialize(() => {
+        db.get(`SELECT COUNT(*) AS total FROM users`, [], (err, totalRow) => {
+            if (err) return bot.editMessageText('❌ Ошибка при подсчёте пользователей', { chat_id: chatId, message_id: statusMsg.message_id });
+
+            db.get(`SELECT COUNT(*) AS blocked FROM users WHERE blocked = 1`, [], (err, blockedRow) => {
+                if (err) return bot.editMessageText('❌ Ошибка при подсчёте заблокированных', { chat_id: chatId, message_id: statusMsg.message_id });
+
+                const totalUsers = totalRow.total || 0;
+                const blockedUsers = blockedRow.blocked || 0;
+                const totalTickets = Object.keys(tickets).length;
+                const totalRequests = Object.keys(requestsQueue).length;
+
+                const text = `📊 *Статистика бота:*\n\n` +
+                             `👥 Всего пользователей: ${totalUsers}\n` +
+                             `🚫 Заблокировано пользователей: ${blockedUsers}\n` +
+                             `🎫 Активные тикеты: ${totalTickets}\n` +
+                             `📨 Активные запросы: ${totalRequests}`;
+
+                bot.editMessageText(text, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' });
+            });
+        });
+    });
+});
 
 
 
@@ -416,21 +562,137 @@ bot.onText(/^\/tickets$/, (msg) => {
 
 // ===== CALLBACK-КНОПКИ =====
 const rejectSessions = {}; // { adminId: reqId }
+const adminMessageSessions = {}; // { adminId: targetUserId }
+
+// Генератор клавиатуры
+function generateKeyboard(userObj) {
+    return {
+        inline_keyboard: [
+            [
+                {
+                    text: userObj.blocked ? '🔓 Разблокировать запросы' : '🔒 Заблокировать запросы',
+                    callback_data: `toggleBlockReq_${userObj.userId}`
+                },
+                {
+                    text: userObj.ticketBlocked ? '🔓 Разблокировать тикеты' : '🔒 Заблокировать тикеты',
+                    callback_data: `toggleBlockTicket_${userObj.userId}`
+                }
+            ],
+            [
+                {
+                    text: '✉️ Написать пользователю',
+                    callback_data: `writeUser_${userObj.userId}`
+                }
+            ]
+        ]
+    };
+}
 
 bot.on('callback_query', async (query) => {
     const id = query.from.id;
 
-    // Создаём объект пользователя, если его нет
     const user = userRequests[id] ||= {
-        acknowledgedRules: false,
         blocked: false,
         ticketBlocked: false,
-        timestamp: 0,
-        ticketTimestamp: 0,
-        selectedAction: null,
         userId: id,
         username: query.from.username ? `@${query.from.username}` : query.from.first_name
     };
+
+    if (query.data.startsWith('getUser_')) {
+        if (!botAdmins.has(id)) return bot.answerCallbackQuery(query.id, { text: '❌ Ты не админ!' });
+
+        const targetUserId = parseInt(query.data.split('_')[1]);
+        const targetUser = userRequests[targetUserId] ||= {
+            blocked: false,
+            ticketBlocked: false,
+            userId: targetUserId,
+            username: `ID:${targetUserId}`
+        };
+
+        const memberStatus = await isUserInGroup(targetUserId) ? 'Участник группы' : 'Не в группе';
+        const isAdmin = botAdmins.has(targetUserId) ? 'Админ' : 'Пользователь';
+
+        const text = `👤 *Пользователь:* ${targetUser.username}\n` +
+                     `🆔 *ID:* ${targetUserId}\n` +
+                     `💬 *Статус:* ${isAdmin}\n` +
+                     `🚫 *Заблокирован для запросов:* ${targetUser.blocked ? 'Да' : 'Нет'}\n` +
+                     `🎫 *Заблокирован для тикетов:* ${targetUser.ticketBlocked ? 'Да' : 'Нет'}\n` +
+                     `🔗 *В группе:* ${memberStatus}`;
+
+        await bot.editMessageText(text, {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id,
+            parse_mode: 'Markdown',
+            reply_markup: generateKeyboard(targetUser)
+        });
+
+        return bot.answerCallbackQuery(query.id);
+    }
+
+    // ===== Динамическая блокировка запросов =====
+    if (query.data.startsWith('toggleBlockReq_')) {
+        const uid = parseInt(query.data.split('_')[1]);
+        const usr = userRequests[uid] ||= { blocked: false, ticketBlocked: false, userId: uid, username: `ID:${uid}` };
+        usr.blocked = !usr.blocked;
+        upsertUserToDB(usr);
+
+        const adminName = userRequests[id]?.username || `ID:${id}`;
+        await bot.sendMessage(adminChatId, usr.blocked
+            ? `🚫 Пользователь ${usr.username} заблокирован админом для запросов [${adminName}](tg://user?id=${id}).`
+            : `✅ Пользователь ${usr.username} разблокирован админом для запросов [${adminName}](tg://user?id=${id}).`,
+            { parse_mode: 'Markdown' }
+        );
+
+        await bot.editMessageReplyMarkup({
+            inline_keyboard: generateKeyboard(usr).inline_keyboard
+        }, {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id
+        });
+
+        return bot.answerCallbackQuery(query.id, { text: usr.blocked ? '🚫 Пользователь заблокирован для запросов' : '✅ Пользователь разблокирован для запросов' });
+    }
+
+    // ===== Динамическая блокировка тикетов =====
+    if (query.data.startsWith('toggleBlockTicket_')) {
+        const uid = parseInt(query.data.split('_')[1]);
+        const usr = userRequests[uid] ||= { blocked: false, ticketBlocked: false, userId: uid, username: `ID:${uid}` };
+        usr.ticketBlocked = !usr.ticketBlocked;
+        upsertUserToDB(usr);
+
+        const adminName = userRequests[id]?.username || `ID:${id}`;
+        await bot.sendMessage(adminChatId, usr.ticketBlocked
+            ? `🚫 Пользователь ${usr.username} заблокирован админом для тикетов [${adminName}](tg://user?id=${id}).`
+            : `✅ Пользователь ${usr.username} разблокирован админом для тикетов [${adminName}](tg://user?id=${id}).`,
+            { parse_mode: 'Markdown' }
+        );
+
+        await bot.editMessageReplyMarkup({
+            inline_keyboard: generateKeyboard(usr).inline_keyboard
+        }, {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id
+        });
+
+        return bot.answerCallbackQuery(query.id, { text: usr.ticketBlocked ? '🚫 Пользователь заблокирован для тикетов' : '✅ Пользователь разблокирован для тикетов' });
+    }
+
+    // ===== Написать пользователю через админ чат =====
+    if (query.data.startsWith('writeUser_')) {
+        const uid = parseInt(query.data.split('_')[1]);
+        const usr = userRequests[uid];
+
+        if (!usr) {
+            return bot.answerCallbackQuery(query.id, { text: '❌ Пользователь не найден.' });
+        }
+
+        // Сохраняем сессию для админа
+        adminMessageSessions[id] = uid;
+
+        await bot.sendMessage(adminChatId, `✉️ Отправьте сообщение для пользователя ${usr.username}.`);
+        return bot.answerCallbackQuery(query.id, { text: '📝 Напишите сообщение в админ чат' });
+    }
+
 
     // Проверка на ознакомление с правилами (только для обычных пользователей)
     if (!botAdmins.has(id)) {
@@ -788,6 +1050,30 @@ bot.onText(/^\/admins$/, (msg) => {
     response += otherAdmins.length ? otherAdmins.join('\n') : '— Нет админов —';
 
     bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+});
+
+
+// ===== Обработка сообщений админов для пересылки =====
+bot.on('message', async (msg) => {
+    const adminId = msg.from.id;
+
+    if (!adminMessageSessions[adminId]) return;
+
+    const targetUserId = adminMessageSessions[adminId];
+    const targetUser = userRequests[targetUserId];
+
+    if (!targetUser) {
+        delete adminMessageSessions[adminId];
+        return bot.sendMessage(adminChatId, '❌ Ошибка: пользователь не найден.');
+    }
+
+    // Отправляем сообщение пользователю без указания имени админа
+    await bot.sendMessage(targetUserId, `✉️ Сообщение от администратора:\n\n${msg.text}`);
+
+    // Уведомляем админа в чате
+    await bot.sendMessage(adminChatId, `✅ Сообщение успешно отправлено пользователю ${targetUser.username}:\n\n${msg.text}`);
+
+    delete adminMessageSessions[adminId];
 });
 
 
