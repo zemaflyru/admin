@@ -1,4 +1,105 @@
 require('dotenv').config();
+
+// === SQLITE НАСТРОЙКА ===
+const sqlite3 = require('sqlite3').verbose();
+const db = new sqlite3.Database(process.env.DB_PATH || './bot_data.db');
+
+// Создаём таблицу для админов
+db.serialize(() => {
+    db.run(`
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT
+        )
+    `);
+});
+
+// Создаём таблицу для пользователей
+db.serialize(() => {
+    db.run(`
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            blocked INTEGER DEFAULT 0,
+            ticket_blocked INTEGER DEFAULT 0
+        )
+    `);
+});
+
+// Загружаем админов из БД при старте
+let botAdmins = new Set();
+db.all(`SELECT * FROM admins`, [], (err, rows) => {
+    if (err) return console.error('Ошибка загрузки админов из БД:', err);
+    rows.forEach(row => botAdmins.add(row.user_id));
+    console.log(`✅ Загружено администраторов: ${rows.length}`);
+});
+
+// Добавляем главного админа, если его нет в БД
+if (!botAdmins.has(774756964)) {
+    botAdmins.add(774756964);
+    addAdminToDB(774756964, '@zoomflyru');
+}
+
+// Функция для добавления админа в БД
+function addAdminToDB(userId, username) {
+    db.run(
+        `INSERT OR REPLACE INTO admins (user_id, username) VALUES (?, ?)`,
+        [userId, username],
+        err => {
+            if (err) console.error('Ошибка при добавлении админа в БД:', err);
+        }
+    );
+}
+
+// Функция для удаления админа из БД
+function removeAdminFromDB(userId) {
+    db.run(`DELETE FROM admins WHERE user_id = ?`, [userId], err => {
+        if (err) console.error('Ошибка при удалении админа из БД:', err);
+    });
+}
+
+// ===== ФУНКЦИИ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ =====
+
+// Добавление или обновление пользователя в БД
+function upsertUserToDB(user) {
+    db.run(
+        `INSERT INTO users (user_id, username, blocked, ticket_blocked)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+            username = excluded.username,
+            blocked = excluded.blocked,
+            ticket_blocked = excluded.ticket_blocked`,
+        [user.userId, user.username, user.blocked ? 1 : 0, user.ticketBlocked ? 1 : 0],
+        err => {
+            if (err) console.error('Ошибка сохранения пользователя в БД:', err);
+        }
+    );
+}
+
+// Загрузка всех пользователей из БД при старте
+function loadUsersFromDB() {
+    db.all(`SELECT * FROM users`, [], (err, rows) => {
+        if (err) return console.error('Ошибка загрузки пользователей из БД:', err);
+        rows.forEach(row => {
+            userRequests[row.user_id] = {
+                userId: row.user_id,
+                username: row.username,
+                blocked: !!row.blocked,
+                ticketBlocked: !!row.ticket_blocked,
+                acknowledgedRules: false,
+                selectedAction: null,
+                timestamp: 0,
+                ticketTimestamp: 0
+            };
+        });
+        console.log(`✅ Загружено пользователей из БД: ${rows.length}`);
+    });
+}
+
+// Загружаем пользователей при старте
+loadUsersFromDB();
+
+
 const TelegramBot = require('node-telegram-bot-api');
 
 const token = process.env.BOT_TOKEN;
@@ -16,11 +117,6 @@ function isKeyboardChanged(oldKeyboard, newKeyboard) {
     if (!oldKeyboard) return true; // если старой клавиатуры нет, считаем, что изменилась
     return JSON.stringify(oldKeyboard) !== JSON.stringify(newKeyboard);
 }
-
-// Список администраторов бота, которым разрешено работать с запросами и тикетами
-let botAdmins = new Set(); // хранит userId
-botAdmins.add(774756964); // главный админ
-
 
 // ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 async function getInviteLink() {
@@ -157,59 +253,140 @@ bot.onText(/^\/ticket$/, async (msg) => {
     user.selectedAction = 'ticket_wait';
 });
 
-// ===== ОБРАБОТКА СОБЩЕНИЙ ДЛЯ ТИКЕТОВ =====
+// ===== ОБЩАЯ ОБРАБОТКА СООБЩЕНИЙ (ТИКЕТЫ И ЗАПРОСЫ) =====
 bot.on('message', async (msg) => {
     if (msg.chat.type !== 'private') return;
     const userId = msg.from.id;
     const user = userRequests[userId];
-    if (!user || user.selectedAction !== 'ticket_wait' || user.ticketBlocked) return;
-
+    if (!user || !['ticket_wait', 'request'].includes(user.selectedAction)) return;
     if (msg.text && msg.text.startsWith('/')) return;
 
+    const isTicket = user.selectedAction === 'ticket_wait';
     const now = Date.now();
-    if (user.ticketTimestamp && now - user.ticketTimestamp < 60000) {
-        const remaining = Math.ceil((60000 - (now - user.ticketTimestamp)) / 1000);
-        return bot.sendMessage(userId, `⏱ Подождите ${remaining} секунд перед новым тикетом.`);
+
+    // --- Тайм-аут для тикета/запроса
+    const lastTimeKey = isTicket ? 'ticketTimestamp' : 'requestTimestamp';
+    const minInterval = isTicket ? 60000 : 180000;
+    if (user[lastTimeKey] && now - user[lastTimeKey] < minInterval) {
+        const remaining = Math.ceil((minInterval - (now - user[lastTimeKey])) / 1000);
+        return bot.sendMessage(userId, `⏱ Подождите ${remaining} секунд перед новым ${isTicket ? 'тикетом' : 'запросом'}.`);
     }
 
-    let text = msg.caption || msg.text || '(без текста)';
-    let contentType = null;
-    let content = null;
+    // --- Проверка подписки для запроса
+    if (!isTicket) {
+        const subscribed = await isUserInGroup(userId);
+        if (!subscribed) {
+            const inviteLink = await getInviteLink();
+            return bot.sendMessage(userId, '📌 Подпишитесь на группу для отправки запроса.', {
+                reply_markup: { inline_keyboard: [[{ text: '➡️ Подписаться', url: inviteLink }]] }
+            });
+        }
+    }
 
-    if (msg.photo) contentType = 'photo', content = msg.photo[msg.photo.length - 1].file_id;
-    else if (msg.video) contentType = 'video', content = msg.video.file_id;
-    else if (msg.document) contentType = 'document', content = msg.document.file_id;
-    else if (msg.voice) contentType = 'voice', content = msg.voice.file_id;
-    else contentType = 'text', content = text;
+    // --- Инициализация временного хранилища
+    if (!user.tempMedia) user.tempMedia = [];
+    if (!user.lastCaption) user.lastCaption = '';
 
-    const ticketId = ticketCounter++;
-    tickets[ticketId] = { userId, username: user.username, text, contentType, content };
-    user.ticketTimestamp = now;
-    user.selectedAction = null;
+    // --- Сохраняем медиа
+    if (msg.photo) user.tempMedia.push({ type: 'photo', media: msg.photo.at(-1).file_id });
+    else if (msg.video) user.tempMedia.push({ type: 'video', media: msg.video.file_id });
+    else if (msg.document) user.tempMedia.push({ type: 'document', media: msg.document.file_id });
+    else if (msg.voice) user.tempMedia.push({ type: 'voice', media: msg.voice.file_id });
 
-    bot.sendMessage(userId, `✅ Ваш тикет #${ticketId} отправлен администрации.`);
+    // --- Сохраняем caption (если есть)
+    if (msg.caption) user.lastCaption = msg.caption;
+    else if (msg.text && !msg.media_group_id) user.lastCaption = msg.text;
 
-    // Капшен с инструкцией для админов
-    const caption = `📩 *Новый тикет #${ticketId}*\n👤 ${user.username} (${userId})\n💬 ${text}\n\nДля ответа на тикет используйте команду:\n/aticket ${ticketId} <текст ответа>`;
+    // --- Таймер для медиагруппы
+    clearTimeout(user.mediaTimeout);
+    user.mediaTimeout = setTimeout(() => finalizeMessage(userId), msg.media_group_id ? 1500 : 500);
 
-    // Динамическая кнопка блокировки/разблокировки
-    const adminKeyboard = {
-        inline_keyboard: [
-            [{ 
-                text: userRequests[userId].blocked ? '🔓 Разблокировать' : '🔒 Заблокировать', 
-                callback_data: `ticket_toggleBlock_${userId}_${ticketId}` 
-            }]
-        ]
-    };
+    // --- Финализация тикета/запроса
+    async function finalizeMessage(uid) {
+        const usr = userRequests[uid];
+        if (!usr || usr._finalizing) return;
+        usr._finalizing = true;
 
-    switch (contentType) {
-        case 'photo': await bot.sendPhoto(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: adminKeyboard }); break;
-        case 'video': await bot.sendVideo(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: adminKeyboard }); break;
-        case 'document': await bot.sendDocument(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: adminKeyboard }); break;
-        case 'voice': await bot.sendVoice(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: adminKeyboard }); break;
-        default: await bot.sendMessage(adminChatId, caption, { parse_mode: 'Markdown', reply_markup: adminKeyboard });
+        const idCounter = isTicket ? ticketCounter++ : requestCounter++;
+        const caption = usr.lastCaption?.trim() || '(без текста)';
+
+        const adminCaption = isTicket
+            ? `📩 *Новый тикет #${idCounter}*\n👤 ${usr.username} (${uid})\n💬 ${caption}\n\nДля ответа:\n/aticket ${idCounter} <текст ответа>`
+            : `📨 *Новый запрос #${idCounter}*\n👤 [${usr.username}](tg://user?id=${uid})\n🆔 ${uid}\n💬 ${caption}`;
+
+        const adminKeyboard = {
+            inline_keyboard: isTicket
+                ? [[{ text: usr.ticketBlocked ? '🔓 Разблокировать' : '🔒 Заблокировать', callback_data: `ticket_toggleBlock_${uid}_${idCounter}` }]]
+                : [[
+                    { text: '✅ Опубликовать', callback_data: `req_${idCounter}_publish` },
+                    { text: '❌ Отклонить', callback_data: `req_${idCounter}_reject` },
+                    { text: usr.requestBlocked ? '🔓 Разблокировать' : '🔒 Блок/Разблок', callback_data: `req_${idCounter}_block` }
+                ]],
+        };
+
+        // Уведомление пользователя
+        await bot.sendMessage(uid, `✅ Ваш ${isTicket ? 'тикет' : 'запрос'} #${idCounter} отправлен администрации.`);
+
+        try {
+            if (usr.tempMedia.length > 0) {
+    if (usr.tempMedia.length === 1) {
+        const m = usr.tempMedia[0];
+        const sendOpts = { caption: adminCaption, parse_mode: 'Markdown' };
+        let sentMsg;
+        switch (m.type) {
+            case 'photo': sentMsg = await bot.sendPhoto(adminChatId, m.media, sendOpts); break;
+            case 'video': sentMsg = await bot.sendVideo(adminChatId, m.media, sendOpts); break;
+            case 'document': sentMsg = await bot.sendDocument(adminChatId, m.media, sendOpts); break;
+            case 'voice': sentMsg = await bot.sendVoice(adminChatId, m.media, sendOpts); break;
+            default: sentMsg = await bot.sendMessage(adminChatId, adminCaption, { parse_mode: 'Markdown' });
+        }
+        // --- Прикрепляем кнопки только если caption пустой
+        if (!adminCaption) {
+            await bot.sendMessage(adminChatId, ' ', { reply_to_message_id: sentMsg.message_id, reply_markup: adminKeyboard });
+        } else {
+            // Для Telegram лучше прикреплять кнопки через отдельное сообщение с текстом " " только если caption не используется
+            await bot.sendMessage(adminChatId, '⬇️ Действия', { reply_to_message_id: sentMsg.message_id, reply_markup: adminKeyboard });
+        }
+    } else {
+        const mediaGroup = usr.tempMedia.map((m, i) => ({
+            type: m.type === 'voice' ? 'audio' : m.type,
+            media: m.media,
+            caption: i === 0 ? adminCaption : undefined,
+            parse_mode: 'Markdown'
+        }));
+        const sentGroup = await bot.sendMediaGroup(adminChatId, mediaGroup);
+        const firstMsgId = sentGroup[0].message_id;
+        // --- Кнопки к первому сообщению медиагруппы
+        await bot.sendMessage(adminChatId, '⬇️ Действия', { reply_to_message_id: firstMsgId, reply_markup: adminKeyboard });
+    }
+} else {
+    // Только текст
+    await bot.sendMessage(adminChatId, adminCaption, { parse_mode: 'Markdown', reply_markup: adminKeyboard });
+}
+
+        } catch (err) {
+            console.error('Ошибка отправки сообщения:', err);
+            await bot.sendMessage(adminChatId, adminCaption, { parse_mode: 'Markdown', reply_markup: adminKeyboard });
+        }
+
+        // --- Сохраняем тикет/запрос
+        if (isTicket) {
+            tickets[idCounter] = { userId: uid, username: usr.username, text: caption, media: usr.tempMedia || [] };
+            usr.ticketTimestamp = Date.now();
+        } else {
+            requestsQueue[idCounter] = { userId: uid, username: usr.username, text: caption, media: usr.tempMedia || [] };
+            usr.requestTimestamp = Date.now();
+        }
+
+        usr.selectedAction = null;
+        usr.tempMedia = [];
+        usr.lastCaption = '';
+        usr._finalizing = false;
     }
 });
+
+
+
 
 
 // ===== /aticket =====
@@ -253,6 +430,7 @@ bot.on('callback_query', async (query) => {
     const user = userRequests[id] ||= {
         acknowledgedRules: false,
         blocked: false,
+        ticketBlocked: false,
         timestamp: 0,
         ticketTimestamp: 0,
         selectedAction: null,
@@ -287,46 +465,38 @@ bot.on('callback_query', async (query) => {
         return bot.answerCallbackQuery(query.id, { text: '❌ Ты не админ, пошёл вон!' });
     }
 
+    // ===== Меню пользователя =====
     if (query.data === 'menu_request') {
-    // 🔒 Проверка блокировки
-    if (user.blocked) {
-        await bot.answerCallbackQuery(query.id, { text: '🚫 Вы заблокированы и не можете отправлять запросы.' });
-        return;
+        if (user.blocked) {
+            await bot.answerCallbackQuery(query.id, { text: '🚫 Вы заблокированы и не можете отправлять запросы.' });
+            return;
+        }
+        const subscribed = await isUserInGroup(id);
+        if (!subscribed) {
+            const inviteLink = await getInviteLink();
+            return bot.sendMessage(id, '📌 Подпишитесь на группу для отправки запроса.', {
+                reply_markup: { inline_keyboard: [[{ text: '➡️ Подписаться', url: inviteLink }]] }
+            });
+        }
+        user.selectedAction = 'request';
+        return bot.sendMessage(id, '📨 Отправьте сообщение (текст, фото, видео, документ) для запроса.');
     }
 
-    const subscribed = await isUserInGroup(id);
-    if (!subscribed) {
-        const inviteLink = await getInviteLink();
-        return bot.sendMessage(id, '📌 Подпишитесь на группу для отправки запроса.', {
-            reply_markup: { inline_keyboard: [[{ text: '➡️ Подписаться', url: inviteLink }]] }
-        });
+    if (query.data === 'menu_ticket') {
+        if (user.ticketBlocked) {
+            await bot.answerCallbackQuery(query.id, { text: '🚫 Вы заблокированы и не можете отправлять тикеты.' });
+            return;
+        }
+        const subscribed = await isUserInGroup(id);
+        if (!subscribed) {
+            const inviteLink = await getInviteLink();
+            return bot.sendMessage(id, '📌 Подпишитесь на группу для отправки тикета.', {
+                reply_markup: { inline_keyboard: [[{ text: '➡️ Подписаться', url: inviteLink }]] }
+            });
+        }
+        user.selectedAction = 'ticket_wait';
+        return bot.sendMessage(id, '📸 Отправьте сообщение для тикета (можете прикрепить фото, видео или документ, а также добавить подпись).');
     }
-
-    user.selectedAction = 'request';
-    return bot.sendMessage(id, '📨 Отправьте сообщение (текст, фото, видео, документ) для запроса.');
-}
-
-if (query.data === 'menu_ticket') {
-    // 🔒 Проверка блокировки
-    if (user.ticketBlocked) {
-        await bot.answerCallbackQuery(query.id, { text: '🚫 Вы заблокированы и не можете отправлять тикеты.' });
-        return;
-    }
-
-    const subscribed = await isUserInGroup(id);
-    if (!subscribed) {
-        const inviteLink = await getInviteLink();
-        return bot.sendMessage(id, '📌 Подпишитесь на группу для отправки тикета.', {
-            reply_markup: { inline_keyboard: [[{ text: '➡️ Подписаться', url: inviteLink }]] }
-        });
-    }
-
-    user.selectedAction = 'ticket_wait';
-    return bot.sendMessage(id, '📸 Отправьте сообщение для тикета (можете прикрепить фото, видео или документ, а также добавить подпись).');
-}
-
-
-
 
     // ===== Обработка запросов админки =====
     if (query.data.startsWith('req_')) {
@@ -341,40 +511,64 @@ if (query.data === 'menu_ticket') {
 
         switch (action) {
             case 'publish': {
-                switch (req.contentType) {
-                    case 'photo': await bot.sendPhoto(groupChatId, req.content, { caption: req.text || undefined }); break;
-                    case 'video': await bot.sendVideo(groupChatId, req.content, { caption: req.text || undefined }); break;
-                    case 'document': await bot.sendDocument(groupChatId, req.content, { caption: req.text || undefined }); break;
-                    case 'voice': await bot.sendVoice(groupChatId, req.content); break;
-                    default: await bot.sendMessage(groupChatId, req.text || '(пустой запрос)');
+                try {
+                    // Используем медиа из requestsQueue
+                    if (req.media && req.media.length > 0) {
+                        if (req.media.length === 1) {
+                            const m = req.media[0];
+                            const opts = { caption: req.text || undefined, parse_mode: 'Markdown' };
+                            switch (m.type) {
+                                case 'photo': await bot.sendPhoto(groupChatId, m.media, opts); break;
+                                case 'video': await bot.sendVideo(groupChatId, m.media, opts); break;
+                                case 'document': await bot.sendDocument(groupChatId, m.media, opts); break;
+                                case 'voice': await bot.sendVoice(groupChatId, m.media, opts); break;
+                                default: await bot.sendMessage(groupChatId, req.text || '(пустой запрос)');
+                            }
+                        } else {
+                            const mediaGroup = req.media.map((m, i) => ({
+                                type: m.type === 'voice' ? 'audio' : m.type,
+                                media: m.media,
+                                caption: i === 0 ? req.text || undefined : undefined,
+                                parse_mode: 'Markdown'
+                            }));
+                            const sentGroup = await bot.sendMediaGroup(groupChatId, mediaGroup);
+                        }
+                    } else {
+                        await bot.sendMessage(groupChatId, req.text || '(пустой запрос)');
+                    }
+
+                    await bot.sendMessage(req.userId, '✅ Ваш запрос опубликован анонимно.');
+                    const adminName = userRequests[id]?.username || `ID: ${id}`;
+                    await bot.sendMessage(adminChatId, `✅ Запрос #${reqId} опубликован админом [${adminName}](tg://user?id=${id}).`, { parse_mode: 'Markdown' });
+                    delete requestsQueue[reqId];
+                    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: query.message.chat.id, message_id: query.message.message_id });
+                    return;
+                } catch (err) {
+                    console.error('Ошибка публикации запроса:', err);
+                    return bot.answerCallbackQuery(query.id, { text: 'Ошибка публикации ❌' });
                 }
-                await bot.sendMessage(req.userId, '✅ Ваш запрос опубликован анонимно.');
-                const adminName = userRequests[id]?.username || `ID: ${id}`;
-                await bot.sendMessage(adminChatId, `✅ Запрос #${reqId} опубликован админом [${adminName}](tg://user?id=${id}).`, { parse_mode: 'Markdown' });
-                delete requestsQueue[reqId];
-                await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: query.message.chat.id, message_id: query.message.message_id });
-                return;
             }
 
             case 'reject': {
-    // Сохраняем сессию, чтобы админ написал причину
-    rejectSessions[id] = reqId;
-    await bot.sendMessage(adminChatId, `✏️ Админ [${userRequests[id]?.username || `ID:${id}` }](tg://user?id=${id}) нажал отклонить запрос #${reqId}. Напишите причину:`, { parse_mode: 'Markdown' });
-    return await bot.answerCallbackQuery(query.id);
-}
+                rejectSessions[id] = reqId;
+                await bot.sendMessage(adminChatId, `✏️ Админ [${userRequests[id]?.username || `ID:${id}` }](tg://user?id=${id}) нажал отклонить запрос #${reqId}. Напишите причину:`, { parse_mode: 'Markdown' });
+                return await bot.answerCallbackQuery(query.id);
+            }
 
             case 'block': {
-                targetUser.blocked = !targetUser.blocked;
-                const blocked = targetUser.blocked;
-                await bot.sendMessage(req.userId, blocked
-                    ? '🚫 Вы заблокированы и не можете отправлять запросы.'
-                    : '✅ Вы разблокированы и теперь можете отправлять запросы.'
-                );
+    targetUser.blocked = !targetUser.blocked;
+    upsertUserToDB(targetUser); // <-- сохраняем изменения в БД
+    const blocked = targetUser.blocked;
+
+    await bot.sendMessage(req.userId, blocked
+        ? '🚫 Вы заблокированы и не можете отправлять запросы.'
+        : '✅ Вы разблокированы и теперь можете отправлять запросы.'
+    );
                 const newKeyboard = {
                     inline_keyboard: [[
                         { text: '✅ Опубликовать', callback_data: `req_${reqId}_publish` },
                         { text: '❌ Отклонить', callback_data: `req_${reqId}_reject` },
-                        { text: blocked ? '🔓 Разблокировать' : '🔒 Заблокировать', callback_data: `req_${reqId}_block` }
+                        { text: blocked ? '🔓 Разблокировать' : '🔒 Блок/Разблок', callback_data: `req_${reqId}_block` }
                     ]]
                 };
                 await bot.editMessageReplyMarkup(newKeyboard, { chat_id: query.message.chat.id, message_id: query.message.message_id });
@@ -391,61 +585,60 @@ if (query.data === 'menu_ticket') {
     }
 
     // ===== Обработка тикетов =====
-if (query.data.startsWith('ticket_')) {
-    const parts = query.data.split('_');
-    const action = parts[1]; // toggleBlock
-    const userIdTarget = parseInt(parts[2]);
-    const ticketId = parseInt(parts[3]);
+    if (query.data.startsWith('ticket_')) {
+        const parts = query.data.split('_');
+        const action = parts[1]; // toggleBlock
+        const userIdTarget = parseInt(parts[2]);
+        const ticketId = parseInt(parts[3]);
 
-    const ticket = tickets[ticketId];
-    if (!ticket) {
-        await bot.answerCallbackQuery(query.id, { text: '❌ Тикет уже обработан.' });
-        return;
-    }
-
-    // создаём объект пользователя если нет
-    userRequests[userIdTarget] ||= { blocked: false, ticketBlocked: false, username: `ID: ${userIdTarget}` };
-
-    if (action === 'toggleBlock') {
-        // теперь блокируем только тикеты
-        userRequests[userIdTarget].ticketBlocked = !userRequests[userIdTarget].ticketBlocked;
-        const blocked = userRequests[userIdTarget].ticketBlocked;
-
-        await bot.sendMessage(userIdTarget, blocked
-            ? '🚫 Вы заблокированы и не можете отправлять тикеты.'
-            : '✅ Вы разблокированы и теперь можете отправлять тикеты.'
-        );
-
-        await bot.answerCallbackQuery(query.id, {
-            text: blocked ? '🚫 Пользователь заблокирован для тикетов' : '✅ Пользователь разблокирован для тикетов'
-        });
-
-        const updatedKeyboard = {
-            inline_keyboard: [
-                [{ 
-                    text: blocked ? '🔓 Разблокировать' : '🔒 Заблокировать', 
-                    callback_data: `ticket_toggleBlock_${userIdTarget}_${ticketId}` 
-                }]
-            ]
-        };
-
-        if (isKeyboardChanged(query.message.reply_markup, updatedKeyboard)) {
-            await bot.editMessageReplyMarkup(updatedKeyboard, {
-                chat_id: query.message.chat.id,
-                message_id: query.message.message_id
-            });
+        const ticket = tickets[ticketId];
+        if (!ticket) {
+            await bot.answerCallbackQuery(query.id, { text: '❌ Тикет уже обработан.' });
+            return;
         }
 
-        const adminName = userRequests[id]?.username || `ID: ${id}`;
-        await bot.sendMessage(adminChatId, blocked
-            ? `🚫 Пользователь ${userRequests[userIdTarget].username} заблокирован для тикетов админом [${adminName}](tg://user?id=${id}).`
-            : `✅ Пользователь ${userRequests[userIdTarget].username} разблокирован для тикетов админом [${adminName}](tg://user?id=${id}).`,
-            { parse_mode: 'Markdown' }
-        );
-    }
-}
+        userRequests[userIdTarget] ||= { blocked: false, ticketBlocked: false, username: `ID: ${userIdTarget}` };
 
-}); // <-- закрыта функция callback_query
+        if (action === 'toggleBlock') {
+    userRequests[userIdTarget].ticketBlocked = !userRequests[userIdTarget].ticketBlocked;
+    upsertUserToDB(userRequests[userIdTarget]); // <-- сохраняем изменения в БД
+    const blocked = userRequests[userIdTarget].ticketBlocked;
+
+    await bot.sendMessage(userIdTarget, blocked
+        ? '🚫 Вы заблокированы и не можете отправлять тикеты.'
+        : '✅ Вы разблокированы и теперь можете отправлять тикеты.'
+    );
+
+            await bot.answerCallbackQuery(query.id, {
+                text: blocked ? '🚫 Пользователь заблокирован для тикетов' : '✅ Пользователь разблокирован для тикетов'
+            });
+
+            const updatedKeyboard = {
+                inline_keyboard: [
+                    [{
+                        text: blocked ? '🔓 Разблокировать' : '🔒 Заблокировать',
+                        callback_data: `ticket_toggleBlock_${userIdTarget}_${ticketId}`
+                    }]
+                ]
+            };
+
+            if (isKeyboardChanged(query.message.reply_markup, updatedKeyboard)) {
+                await bot.editMessageReplyMarkup(updatedKeyboard, {
+                    chat_id: query.message.chat.id,
+                    message_id: query.message.message_id
+                });
+            }
+
+            const adminName = userRequests[id]?.username || `ID: ${id}`;
+            await bot.sendMessage(adminChatId, blocked
+                ? `🚫 Пользователь ${userRequests[userIdTarget].username} заблокирован для тикетов админом [${adminName}](tg://user?id=${id}).`
+                : `✅ Пользователь ${userRequests[userIdTarget].username} разблокирован для тикетов админом [${adminName}](tg://user?id=${id}).`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+    }
+});
+
 
 
 
@@ -498,6 +691,7 @@ bot.onText(/^\/admin(?:\s(.+))?$/, async (msg, match) => {
 
         // === Добавляем в список админов ===
         botAdmins.add(Number(userId));
+        addAdminToDB(Number(userId), displayName);
         userRequests[userId] ||= {};
         userRequests[userId].username = displayName;
 
@@ -563,6 +757,7 @@ bot.onText(/^\/unadmin(?:\s(.+))?$/, async (msg, match) => {
 
         // === Удаляем из списка ===
         botAdmins.delete(Number(userId));
+        removeAdminFromDB(Number(userId));
 
         const username = userRequests[userId]?.username || `ID: ${userId}`;
         bot.sendMessage(msg.chat.id, `✅ Пользователь ${username} снят с прав администратора.`);
@@ -634,7 +829,7 @@ bot.on('message', async (msg) => {
     const user = userRequests[userId] ||= {
         acknowledgedRules: false,
         blocked: false,
-        ticketBlocked: false,
+        requestBlocked: false,
         selectedAction: null,
         userId,
         username: msg.from.username ? `@${msg.from.username}` : msg.from.first_name
@@ -645,7 +840,7 @@ bot.on('message', async (msg) => {
 
     // ===== ОБРАБОТКА ПУСТЫХ/ОБЫЧНЫХ СООБЩЕНИЙ =====
     if (!user.selectedAction) {
-        if (!user.blocked && !user.ticketBlocked) {
+        if (!user.blocked && !user.requestBlocked) {
             const keyboard = user.acknowledgedRules
                 ? {
                     inline_keyboard: [
@@ -663,53 +858,5 @@ bot.on('message', async (msg) => {
             return bot.sendMessage(userId, '👋 Выберите действие:', { reply_markup: keyboard });
         }
     }
-
-    // ===== ОБРАБОТКА ЗАПРОСОВ =====
-    if (user.selectedAction !== 'request') return;
-
-    const subscribed = await isUserInGroup(userId);
-    if (!subscribed) {
-        const inviteLink = await getInviteLink();
-        return bot.sendMessage(userId, '📌 Подпишитесь на группу для отправки запроса.', {
-            reply_markup: { inline_keyboard: [[{ text: '➡️ Подписаться', url: inviteLink }]] }
-        });
-    }
-
-    const now = Date.now();
-    if (user.timestamp && now - user.timestamp < 180000) {
-        const wait = Math.ceil((180000 - (now - user.timestamp)) / 1000);
-        return bot.sendMessage(userId, `⏱ Подождите ${wait} секунд перед новым запросом.`);
-    }
-
-    user.timestamp = now;
-
-    let contentType, content, text = msg.caption || msg.text || '';
-    if (msg.photo) contentType = 'photo', content = msg.photo.at(-1).file_id;
-    else if (msg.video) contentType = 'video', content = msg.video.file_id;
-    else if (msg.document) contentType = 'document', content = msg.document.file_id;
-    else if (msg.voice) contentType = 'voice', content = msg.voice.file_id;
-    else contentType = 'text', content = text;
-
-    const reqId = requestCounter++;
-    requestsQueue[reqId] = { userId, username: user.username, text, contentType, content };
-
-    const keyboard = {
-        inline_keyboard: [[
-            { text: '✅ Опубликовать', callback_data: `req_${reqId}_publish` },
-            { text: '❌ Отклонить', callback_data: `req_${reqId}_reject` },
-            { text: '🚫 Блок/Разблок', callback_data: `req_${reqId}_block` }
-        ]]
-    };
-
-    const caption = `📨 *Пришёл новый запрос!*\n👤 [${user.username}](tg://user?id=${userId})\n🆔 ${userId}\n💬 ${text || '(без текста)'}`;
-    switch (contentType) {
-        case 'photo': bot.sendPhoto(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: keyboard }); break;
-        case 'video': bot.sendVideo(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: keyboard }); break;
-        case 'document': bot.sendDocument(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: keyboard }); break;
-        case 'voice': bot.sendVoice(adminChatId, content, { caption, parse_mode: 'Markdown', reply_markup: keyboard }); break;
-        default: bot.sendMessage(adminChatId, caption, { parse_mode: 'Markdown', reply_markup: keyboard });
-    }
-
-    await bot.sendMessage(userId, '✅ Ваш запрос отправлен администрации.');
-    user.selectedAction = null;
-}); // <-- закрываем bot.on('message', ...)
+    
+});
